@@ -5,9 +5,11 @@ module Akami
     class VerifySignature
       include Akami::XPathHelper
       include Akami::C14nHelper
+      include Akami::EncodeHelper
 
       class InvalidDigest < RuntimeError; end
       class InvalidSignedValue < RuntimeError; end
+      class UnsupportedAlgorithm < RuntimeError; end
 
       attr_reader :response_body, :document
 
@@ -16,25 +18,16 @@ module Akami
         @document = create_document
       end
 
-      def generate_digest(element)
-        element = element_for_xpath(element) if element.is_a? String
-        xml = canonicalize(element)
-        digest(xml).strip
-      end
-
-      def supplied_digest(element)
-        element = element_for_xpath(element) if element.is_a? String
-        find_digest_value element.attributes["Id"]
-      end
-
       def signature_value
-        element = element_for_xpath("//Security/Signature/SignatureValue")
-        element ? element.text : ""
+        # element = element_for_xpath("//Security/Signature/SignatureValue")
+        element = xpath(document, '//Security/Signature/SignatureValue') # ignore namespaces
+        element ? element.text.gsub(/\s*/, '') : ""
       end
 
       def certificate
-        certificate_value = element_for_xpath("//Security/BinarySecurityToken").text.strip
-        OpenSSL::X509::Certificate.new Base64.decode64(certificate_value)
+        # certificate_value = element_for_xpath("//Security/BinarySecurityToken").text.strip
+        certificate_value = xpath(document, '//Security/BinarySecurityToken').text # ignore namespaces
+        OpenSSL::X509::Certificate.new decode(certificate_value)
       end
 
       def valid?
@@ -51,17 +44,42 @@ module Akami
 
       private
 
-      def verify
-        xpath(document, "//Security/Signature/SignedInfo/Reference").each do |ref|
-          element_id = ref.attributes["URI"][1..-1] # strip leading '#'
-          element = element_for_xpath(%(//*[@wsu:Id="#{element_id}"]))
-          raise InvalidDigest, "Invalid Digest for #{element_id}" unless supplied_digest(element) == generate_digest(element)
+      def apply_algorithm(ref, element)
+        algorithm = ref.attribute('Algorithm').to_s
+        node = ref.at_xpath('ec:InclusiveNamespaces', { 'ec' => algorithm  })
+        inclusive_namespaces = node ? node.attributes['PrefixList'].to_s.squeeze(' ').split(' ') : nil
+        if algorithm == ExclusiveXMLCanonicalizationWithCommentsAlgorithm
+          with_comments = true
+        elsif algorithm == ExclusiveXMLCanonicalizationAlgorithm
+          with_comments = false
+        else
+          raise UnsupportedAlgorithm, "Unsupported c14n algorithm: #{algorithm}"
         end
+        canonicalize(element, inclusive_namespaces, with_comments)
+      end
 
-        data = canonicalize(signed_info)
-        signature = Base64.decode64(signature_value)
-
-        certificate.public_key.verify(OpenSSL::Digest::SHA1.new, signature, data) or raise InvalidSignedValue, "Could not verify the signature value"
+      def verify
+        # Check digests
+        xpath(document, '//Security/Signature/SignedInfo/Reference').each do |ref|
+          element_id = ref.attributes['URI'].to_s[1..-1] # strip leading '#'
+          element = document.at_xpath("//*[@wsu:Id='#{element_id}']", 'wsu' => WSU_NAMESPACE)
+          if !element.blank?
+            supplied_digest = ref.at_xpath('ds:DigestValue', 'ds' => SignatureNamespace).text.strip
+            # no multiple transformations yet (only first one applies)
+            t = ref.at_xpath('ds:Transforms/ds:Transform', 'ds' => SignatureNamespace)
+            xml = apply_algorithm(t, element)
+            generated_digest = digest(xml).strip
+            raise InvalidDigest, "Invalid digest for #{element_id}: got #{generated_digest}, expected #{supplied_digest}" unless supplied_digest == generated_digest
+          else
+            raise InvalidDigest, "Element #{element_id} is not found in document"
+          end
+        end
+        # Check signature
+        element = signed_info
+        t = element.xpath('ds:CanonicalizationMethod', 'ds' => SignatureNamespace)
+        xml = apply_algorithm(t, element)
+        signature = decode signature_value
+        certificate.public_key.verify(OpenSSL::Digest::SHA1.new, signature, xml) or raise InvalidSignedValue, "Signature is INVALID"
       end
 
       def create_document
@@ -76,12 +94,8 @@ module Akami
         at_xpath document, "//Security/Signature/SignedInfo"
       end
 
-      def find_digest_value(id)
-        at_xpath(document, %(//Security/Signature/SignedInfo/Reference[@URI="##{id}"]/DigestValue)).text
-      end
-
       def digest(string)
-        Base64.encode64 OpenSSL::Digest::SHA1.digest(string)
+        encode OpenSSL::Digest::SHA1.digest(string)
       end
     end
   end

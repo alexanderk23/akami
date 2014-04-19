@@ -3,6 +3,7 @@ require "digest/sha1"
 require "akami/core_ext/hash"
 require "akami/xpath_helper"
 require "akami/c14n_helper"
+require "akami/encode_helper"
 require "time"
 require "gyoku"
 
@@ -10,23 +11,40 @@ require "akami/wsse/verify_signature"
 require "akami/wsse/signature"
 
 module Akami
-
   # = Akami::WSSE
   #
   # Building Web Service Security.
   class WSSE
 
     # Namespace for WS Security Secext.
-    WSE_NAMESPACE = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+    WSE_NAMESPACE = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd'.freeze
 
     # Namespace for WS Security Utility.
-    WSU_NAMESPACE = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
+    WSU_NAMESPACE = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd'.freeze
+
+    # Namespace for WS Addressing.
+    WSA_NAMESPACE = 'http://www.w3.org/2005/08/addressing'.freeze
+
+    SignatureNamespace = 'http://www.w3.org/2000/09/xmldsig#'.freeze
 
     # PasswordText URI.
-    PASSWORD_TEXT_URI = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"
+    PASSWORD_TEXT_URI = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText'.freeze
 
     # PasswordDigest URI.
-    PASSWORD_DIGEST_URI = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
+    PASSWORD_DIGEST_URI = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest'.freeze
+
+    ExclusiveXMLCanonicalizationAlgorithm = 'http://www.w3.org/2001/10/xml-exc-c14n#'.freeze
+    ExclusiveXMLCanonicalizationWithCommentsAlgorithm = 'http://www.w3.org/2001/10/xml-exc-c14n#WithComments'.freeze
+
+    RSASHA1SignatureAlgorithm = 'http://www.w3.org/2000/09/xmldsig#rsa-sha1'.freeze
+
+    SHA1DigestAlgorithm = 'http://www.w3.org/2000/09/xmldsig#sha1'.freeze
+
+    X509v3ValueType = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3'.freeze
+
+    # Base64Binary URI.
+    Base64EncodingType = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary'.freeze
+
 
     # Returns a value from the WSSE Hash.
     def [](key)
@@ -61,7 +79,7 @@ module Akami
       !!@digest
     end
 
-    attr_writer :digest
+    attr_writer :digest, :env_namespace
 
     # Returns whether to generate a wsse:UsernameToken header.
     def username_token?
@@ -89,7 +107,19 @@ module Akami
 
     # Returns the XML for a WSSE header.
     def to_xml
-      if signature? and signature.have_document?
+      if signature? and signature.have_document? and timestamp?
+        ts = wsu_timestamp.merge!(hash)
+        ts['wsse:Security'].merge!(
+          :attributes! => {
+            'wsu:Timestamp' => { 'wsu:Id' => signature.timestamp_id }
+          }
+        )
+        ts[:attributes!]['wsse:Security']['xmlns:wsu'] = WSU_NAMESPACE
+        hash.merge!(ts)
+        res = wsse_signature.deep_merge!(hash)
+        res['wsse:Security'][:order!] << 'wsu:Timestamp'
+        Gyoku.xml res
+      elsif signature? and signature.have_document?
         Gyoku.xml wsse_signature.merge!(hash)
       elsif username_token? && timestamp?
         Gyoku.xml wsse_username_token.merge!(wsu_timestamp) {
@@ -102,7 +132,7 @@ module Akami
       elsif timestamp?
         Gyoku.xml wsu_timestamp.merge!(hash)
       else
-        ""
+        ''
       end
     end
 
@@ -111,19 +141,24 @@ module Akami
     # Returns a Hash containing wsse:UsernameToken details.
     def wsse_username_token
       if digest?
-        token = security_hash :wsse, "UsernameToken",
-          "wsse:Username" => username,
-          "wsse:Nonce" => Base64.encode64(nonce),
-          "wsu:Created" => timestamp,
-          "wsse:Password" => digest_password,
-          :attributes! => { "wsse:Password" => { "Type" => PASSWORD_DIGEST_URI } }
+        token = security_hash :wsse, 'UsernameToken',
+          'wsse:Username' => username,
+          'wsse:Nonce' => encode(nonce),
+          'wsu:Created' => timestamp,
+          'wsse:Password' => digest_password,
+          :attributes! => {
+            'wsse:Password' => { 'Type' => PASSWORD_DIGEST_URI },
+            'wsse:Nonce' => { 'EncodingType' => Base64EncodingType }
+          }
         # clear the nonce after each use
         @nonce = nil
       else
-        token = security_hash :wsse, "UsernameToken",
-          "wsse:Username" => username,
-          "wsse:Password" => password,
-          :attributes! => { "wsse:Password" => { "Type" => PASSWORD_TEXT_URI } }
+        token = security_hash :wsse, 'UsernameToken',
+          'wsse:Username' => username,
+          'wsse:Password' => password,
+          :attributes! => {
+            'wsse:Password' => { 'Type' => PASSWORD_TEXT_URI }
+          }
       end
       token
     end
@@ -139,31 +174,33 @@ module Akami
 
     # Returns a Hash containing wsu:Timestamp details.
     def wsu_timestamp
-      security_hash :wsu, "Timestamp",
-        "wsu:Created" => (created_at || Time.now).utc.xmlschema,
-        "wsu:Expires" => (expires_at || (created_at || Time.now) + 60).utc.xmlschema
+      security_hash :wsu, 'Timestamp',
+        'wsu:Created' => (created_at || Time.now).utc.xmlschema,
+        'wsu:Expires' => (expires_at || (created_at || Time.now) + 60).utc.xmlschema
     end
 
     # Returns a Hash containing wsse/wsu Security details for a given
     # +namespace+, +tag+ and +hash+.
     def security_hash(namespace, tag, hash, extra_info = {})
-      key = [namespace, tag].compact.join(":")
+      key = [namespace, tag].compact.join(':')
 
       sec_hash = {
-        "wsse:Security" => {
-          key => hash
-        },
-        :attributes! => { "wsse:Security" => { "xmlns:wsse" => WSE_NAMESPACE } }
+        'wsse:Security' => { key => hash },
+        :attributes! => {
+          'wsse:Security' => { 'xmlns:wsse' => WSE_NAMESPACE }
+        }
       }
 
       unless extra_info.empty?
-        sec_hash["wsse:Security"].merge!(extra_info)
+        sec_hash['wsse:Security'].merge!(extra_info)
       end
 
       if signature?
-        sec_hash[:attributes!].merge!("soapenv:mustUnderstand" => "1")
+        sec_hash[:attributes!]['wsse:Security'].merge!("#{env_namespace}:mustUnderstand" => '1')
       else
-        sec_hash["wsse:Security"].merge!(:attributes! => { key => { "wsu:Id" => "#{tag}-#{count}", "xmlns:wsu" => WSU_NAMESPACE } })
+        sec_hash['wsse:Security'].merge!(:attributes! => {
+          key => { 'wsu:Id' => "#{tag}-#{count}", 'xmlns:wsu' => WSU_NAMESPACE }
+        })
       end
 
       sec_hash
@@ -172,17 +209,17 @@ module Akami
     # Returns the WSSE password, encrypted for digest authentication.
     def digest_password
       token = nonce + timestamp + password
-      Base64.encode64(Digest::SHA1.digest(token)).chomp!
+      encode(Digest::SHA1.digest(token))
     end
 
     # Returns a WSSE nonce.
     def nonce
-      @nonce ||= Digest::SHA1.hexdigest random_string + timestamp
+      @nonce ||= random_string # Digest::SHA1.hexdigest random_string + timestamp
     end
 
     # Returns a random String of 100 characters.
     def random_string
-      (0...100).map { ("a".."z").to_a[rand(26)] }.join
+      (0...100).map { ('a'..'z').to_a[rand(26)] }.join
     end
 
     # Returns a WSSE timestamp.
@@ -199,6 +236,11 @@ module Akami
     # Returns a memoized and autovivificating Hash.
     def hash
       @hash ||= Hash.new { |h, k| h[k] = Hash.new(&h.default_proc) }
+    end
+
+    # Returns a SOAP envelope namespace.
+    def env_namespace
+      @env_namespace ||= :env
     end
 
   end
