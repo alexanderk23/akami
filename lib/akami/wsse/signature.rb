@@ -22,7 +22,7 @@ module Akami
         @document = Nokogiri::XML(document)
       end
 
-      def initialize(certs = Certs.new, use_binary_security_token = false)
+      def initialize(certs = Certs.new, use_binary_security_token = true)
         @certs = certs
         @use_binary_security_token = use_binary_security_token
       end
