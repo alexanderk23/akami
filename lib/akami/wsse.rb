@@ -45,7 +45,6 @@ module Akami
     # Base64Binary URI.
     Base64EncodingType = 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary'.freeze
 
-
     # Returns a value from the WSSE Hash.
     def [](key)
       hash[key]

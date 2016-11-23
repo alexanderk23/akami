@@ -1,4 +1,5 @@
 require "akami/wsse/certs"
+require "uuid"
 
 module Akami
   class WSSE
@@ -22,9 +23,43 @@ module Akami
         @document = Nokogiri::XML(document)
       end
 
-      def initialize(certs = Certs.new, use_binary_security_token = true)
+      SIGNED_PARTS_MAP = {
+        body: '//Envelope/Body',
+        message_id: '//Envelope/Header/MessageID',
+        timestamp: '//Envelope/Header/Security/Timestamp',
+        reply_to: '//Envelope/Header/ReplyTo',
+        to: '//Envelope/Header/To',
+        from: '//Envelope/Header/From',
+        action: '//Envelope/Header/Action',
+        fault_to: '//Envelope/Header/FaultTo',
+        relates_to: '//Envelope/Header/RelatesTo'
+      }.freeze
+
+      def part_id(part)
+         @ids[part] ||= "#{part.to_s}-#{uid}".freeze
+      end
+
+      def reset_ids!
+         @ids = {}
+      end
+
+      def timestamp_id
+         part_id :timestamp
+      end
+
+      def security_token_id
+         part_id :security_token
+      end
+
+      def initialize(certs = Certs.new, options = {})
         @certs = certs
-        @use_binary_security_token = use_binary_security_token
+        @ids = {}
+        @options = {
+          use_binary_security_token: true,
+          signed_parts: [ :attachments, :body, :reply_to, :to, :from, :message_id, :fault_to, :action, :relates_to, :timestamp ]
+        }.merge(options)
+
+        @use_binary_security_token = @options[:use_binary_security_token]
       end
 
       def have_document?
@@ -37,20 +72,8 @@ module Akami
         @now ||= Time.now
       end
 
-      def body_id
-        @body_id ||= "Body-#{uid}".freeze
-      end
-
-      def timestamp_id
-        @timestamp_id ||= "Timestamp-#{uid}".freeze
-      end
-
-      def security_token_id
-        @security_token_id ||= "SecurityToken-#{uid}".freeze
-      end
-
       def body_attributes
-        { 'xmlns:wsu' => WSU_NAMESPACE, 'wsu:Id' => body_id }
+        { 'xmlns:wsu' => WSU_NAMESPACE, 'wsu:Id' => part_id(:body) }
       end
 
       def to_token
@@ -58,21 +81,21 @@ module Akami
 
         sig = signed_info.merge(key_info).merge(signature_value)
         sig.merge! :order! => []
-        [ 'SignedInfo', 'SignatureValue', 'KeyInfo' ].each do |key|
+        [ 'ds:SignedInfo', 'ds:SignatureValue', 'ds:KeyInfo' ].each do |key|
           sig[:order!] << key if sig[key]
         end
 
         token = {
-          'Signature' => sig,
+          'ds:Signature' => sig,
           :attributes! => {
-            'Signature' => { 'xmlns' => SignatureNamespace }
+            'ds:Signature' => { 'xmlns:ds' => SignatureNamespace }
           }
         }
 
         token.deep_merge!(binary_security_token) if (use_binary_security_token and certs.cert)
 
         token.merge! :order! => []
-        [ 'wsse:BinarySecurityToken', 'Signature' ].each do |key|
+        [ 'wsse:BinarySecurityToken', 'ds:Signature' ].each do |key|
           token[:order!] << key if token[key]
         end
 
@@ -99,17 +122,17 @@ module Akami
         {
           'wsse:Reference/' => nil,
           :attributes! => {
-            'wsse:Reference/' => { 'ValueType' => X509v3ValueType, 'URI' => "##{security_token_id}" }
+            'wsse:Reference/' => { 'ValueType' => X509v3ValueType, 'URI' => "##{part_id(:security_token)}" }
           }
         }
       end
 
       def x509_data
         {
-          'X509Data' => {
-            'X509IssuerSerial' => {
-              'X509IssuerName' => certs.cert.issuer.to_s(OpenSSL::X509::Name::RFC2253),
-              'X509SerialNumber' => certs.cert.serial
+          'ds:X509Data' => {
+            'ds:X509IssuerSerial' => {
+              'ds:X509IssuerName' => certs.cert.issuer.to_s(OpenSSL::X509::Name::RFC2253),
+              'ds:X509SerialNumber' => certs.cert.serial
             }
           }
         }
@@ -117,17 +140,14 @@ module Akami
 
       def key_info
         {
-          'KeyInfo' => {
-            'wsse:SecurityTokenReference' => use_binary_security_token ? binary_security_token_reference : x509_data,
-            # :attributes! => {
-            #   'wsse:SecurityTokenReference' => { 'xmlns:wsu' => WSU_NAMESPACE }
-            # },
-          },
+          'ds:KeyInfo' => {
+            'wsse:SecurityTokenReference' => use_binary_security_token ? binary_security_token_reference : x509_data
+          }
         }
       end
 
       def signature_value
-        { 'SignatureValue' => the_signature }
+        { 'ds:SignatureValue' => the_signature }
       rescue MissingCertificate
         {}
       end
@@ -136,24 +156,26 @@ module Akami
         reference = []
         reference_uri = []
 
-        reference << signed_info_transforms.merge(signed_info_digest_method).merge({ 'DigestValue' => body_digest })
-        reference_uri << "##{body_id}"
-        if timestamp_digest
-          reference << signed_info_transforms.merge(signed_info_digest_method).merge({ 'DigestValue' => timestamp_digest })
-          reference_uri << "##{timestamp_id}"
+        @options[:signed_parts].each do |part|
+          digest = digest_xpath(SIGNED_PARTS_MAP[part])
+          next if digest.nil?
+          reference << signed_info_transforms.merge(signed_info_digest_method).merge({
+            'ds:DigestValue' => digest
+          })
+          reference_uri << "##{part_id(part)}"
         end
 
         {
-          'SignedInfo' => {
-            'CanonicalizationMethod/' => nil,
-            'SignatureMethod/' => nil,
-            'Reference' => reference,
+          'ds:SignedInfo' => {
+            'ds:CanonicalizationMethod/' => nil,
+            'ds:SignatureMethod/' => nil,
+            'ds:Reference' => reference,
             :attributes! => {
-              'CanonicalizationMethod/' => { 'Algorithm' => ExclusiveXMLCanonicalizationAlgorithm },
-              'SignatureMethod/' => { 'Algorithm' => RSASHA1SignatureAlgorithm },
-              'Reference' => { 'URI' => reference_uri },
+              'ds:CanonicalizationMethod/' => { 'Algorithm' => ExclusiveXMLCanonicalizationAlgorithm },
+              'ds:SignatureMethod/' => { 'Algorithm' => RSASHA1SignatureAlgorithm },
+              'ds:Reference' => { 'URI' => reference_uri },
             },
-            :order! => [ 'CanonicalizationMethod/', 'SignatureMethod/', 'Reference' ]
+            :order! => [ 'ds:CanonicalizationMethod/', 'ds:SignatureMethod/', 'ds:Reference' ]
           }
         }
       end
@@ -166,28 +188,21 @@ module Akami
         encode(signature)
       end
 
-      def body_digest
-        body = canonicalize(at_xpath(@document, '//Envelope/Body'))
-        encode(OpenSSL::Digest::SHA1.digest(body))
-      end
-
-      def timestamp_digest
-        ts = at_xpath(@document, '//Envelope/Header/Security/Timestamp')
-        return nil unless ts
-        ts = canonicalize(ts)
-        encode(OpenSSL::Digest::SHA1.digest(ts))
+      def digest_xpath(xpath)
+        val = at_xpath(@document, xpath)
+        val.nil? ? nil : encode(OpenSSL::Digest::SHA1.digest(canonicalize(val)))
       end
 
       def signed_info_digest_method
-        { "DigestMethod/" => nil, :attributes! => { "DigestMethod/" => { "Algorithm" => SHA1DigestAlgorithm } } }
+        { 'ds:DigestMethod/' => nil, :attributes! => { 'ds:DigestMethod/' => { 'Algorithm' => SHA1DigestAlgorithm } } }
       end
 
       def signed_info_transforms
-        { "Transforms" => { "Transform/" => nil, :attributes! => { "Transform/" => { "Algorithm" => ExclusiveXMLCanonicalizationAlgorithm } } } }
+        { 'ds:Transforms' => { 'ds:Transform/' => nil, :attributes! => { 'ds:Transform/' => { 'Algorithm' => ExclusiveXMLCanonicalizationAlgorithm } } } }
       end
 
       def uid
-        OpenSSL::Digest::SHA1.hexdigest([Time.now, rand].collect(&:to_s).join('/'))
+        UUID.new.generate
       end
 
     end

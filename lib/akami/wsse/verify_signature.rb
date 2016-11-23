@@ -27,6 +27,7 @@ module Akami
       def certificate
         # certificate_value = element_for_xpath("//Security/BinarySecurityToken").text.strip
         certificate_value = xpath(document, '//Security/BinarySecurityToken').text # ignore namespaces
+        return nil if certificate_value.empty?
         OpenSSL::X509::Certificate.new decode(certificate_value)
       end
 
@@ -74,6 +75,7 @@ module Akami
             raise InvalidDigest, "Element #{element_id} is not found in document"
           end
         end
+        return true if certificate.nil? # !!!
         # Check signature
         element = signed_info
         t = element.xpath('ds:CanonicalizationMethod', 'ds' => SignatureNamespace)
